@@ -1,0 +1,212 @@
+trigger:
+  branches:
+    include:
+      - development
+      - test
+      - master
+  batch: true
+  paths:
+    include:
+    - src/
+    - helm/
+
+parameters:
+  - name: deploy_dev
+    displayName: Deploy to Dev?
+    type: boolean
+    default: false
+  - name: deploy_test
+    displayName: Deploy to Test?
+    type: boolean
+    default: false
+  - name: trivy_scan_enabled
+    displayName: Enable Trivy Scan?
+    type: boolean
+    default: true
+  - name: devNamespace
+    displayName: Development Namespace
+    type: string
+    default: 'dev'
+  - name: testNamespace
+    displayName: Test Namespace
+    type: string
+    default: 'test'
+  - name: devClusterName
+    displayName: Development Cluster Name
+    type: string
+    default: 'dev-eks-cluster'
+  - name: testClusterName
+    displayName: Test Cluster Name
+    type: string
+    default: 'test-eks-cluster'
+
+resources:
+  - repo: self
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: build
+  displayName: Build Node.js
+  jobs:
+  - job: build_application
+    displayName: Build and Test Node.js App
+    steps:
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'azure-subscription-connection'
+        KeyVaultName: 'keyvault-name-dev'
+        SecretsFilter: '*'
+        RunAsPreJob: true
+
+    - task: NodeTool@0
+      inputs:
+        versionSpec: '18.x'
+
+    - script: npm ci
+      displayName: Install Dependencies
+
+    - script: npm test
+      displayName: Run Tests
+
+    - script: |
+        curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh
+        ./bin/trufflehog filesystem src --exclude-paths=.git
+      displayName: Run TruffleHog
+
+    - script: npm run build
+      displayName: Build Application
+
+    - task: Bash@3
+      displayName: Create Docker Tag
+      name: version
+      inputs:
+        targetType: inline
+        script: |
+          DOCKER_TAG=${BUILD_SOURCEVERSION:0:7}
+          TIMESTAMP=$(date +%Y/%m/%d-%H:%M:%S)
+          echo "##vso[task.setvariable variable=DOCKER_TAG;isoutput=true]$DOCKER_TAG"
+          echo "##vso[task.setvariable variable=TIMESTAMP;isoutput=true]$TIMESTAMP"
+          echo "##vso[task.setvariable variable=GIT_COMMIT;isoutput=true]${DOCKER_TAG}"
+
+    - task: Docker@2
+      displayName: Docker Login
+      inputs:
+        command: login
+        containerRegistry: 'acr-service-connection'
+
+    - task: Docker@2
+      displayName: Build Docker Image
+      inputs:
+        command: build
+        containerRegistry: 'acr-service-connection'
+        repository: 'nodejs-app'
+        Dockerfile: './Dockerfile'
+        buildContext: '.'
+        tags: '$(DOCKER_TAG)'
+        arguments: '--build-arg BUILD_DATE=$(TIMESTAMP) --build-arg GIT_COMMIT=$(GIT_COMMIT)'
+
+    - task: Docker@2
+      displayName: Push Docker Image
+      inputs:
+        command: push
+        containerRegistry: 'acr-service-connection'
+        repository: 'nodejs-app'
+        tags: '$(DOCKER_TAG)'
+
+    - ${{ if eq(parameters.trivy_scan_enabled, 'true') }}:
+      - script: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy i --exit-code 1 --severity CRITICAL,HIGH myacr.azurecr.io/nodejs-app:$(DOCKER_TAG)
+        displayName: Trivy Scan
+
+- stage: deploy_dev
+  displayName: Deploy To Dev
+  condition: ${{ or(eq(variables['Build.SourceBranchName'], 'development'), eq(parameters['deploy_dev'], 'true')) }}
+  dependsOn: build
+  jobs:
+  - job: deploy_dev
+    variables:
+      DOCKER_TAG: $[ stageDependencies.build.build_application.outputs['version.DOCKER_TAG'] ]
+      ENV: dev
+      NAMESPACE: ${{ parameters.devNamespace }}
+      CLUSTER: ${{ parameters.devClusterName }}
+    steps:
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'azure-subscription-connection'
+        KeyVaultName: 'keyvault-name-dev'
+        SecretsFilter: '*'
+        RunAsPreJob: true
+
+    - task: replacetokens@5
+      inputs:
+        rootDirectory: './helm'
+        targetFiles: 'values-azure-$(ENV).yaml'
+        tokenPattern: 'custom'
+        tokenPrefix: '$('
+        tokenSuffix: ')'
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: 'aws-credentials'
+        regionName: 'us-east-1'
+        awsCommand: 'eks'
+        awsSubCommand: 'update-kubeconfig'
+        awsArguments: '--name $(CLUSTER)'
+      env:
+        KUBECONFIG: ./kubeconfig
+
+    - task: AWSShellScript@1
+      inputs:
+        awsCredentials: 'aws-credentials'
+        regionName: 'us-east-1'
+        scriptType: 'inline'
+        inlineScript: |
+          KUBECONFIG=./kubeconfig helm upgrade --install dev-nodejsapp ./helm -f ./helm/values-azure-$(ENV).yaml --namespace=$(NAMESPACE) --set image.tag=$(DOCKER_TAG) --debug
+
+- stage: deploy_test
+  displayName: Deploy To Test
+  condition: ${{ or(eq(variables['Build.SourceBranchName'], 'test'), eq(parameters['deploy_test'], 'true')) }}
+  dependsOn: build
+  jobs:
+  - job: deploy_test
+    variables:
+      DOCKER_TAG: $[ stageDependencies.build.build_application.outputs['version.DOCKER_TAG'] ]
+      ENV: test
+      NAMESPACE: ${{ parameters.testNamespace }}
+      CLUSTER: ${{ parameters.testClusterName }}
+    steps:
+    - task: AzureKeyVault@2
+      inputs:
+        azureSubscription: 'azure-subscription-connection'
+        KeyVaultName: 'keyvault-name-test'
+        SecretsFilter: '*'
+        RunAsPreJob: true
+
+    - task: replacetokens@5
+      inputs:
+        rootDirectory: './helm'
+        targetFiles: 'values-azure-$(ENV).yaml'
+        tokenPattern: 'custom'
+        tokenPrefix: '$('
+        tokenSuffix: ')'
+
+    - task: AWSCLI@1
+      inputs:
+        awsCredentials: 'aws-credentials'
+        regionName: 'us-east-1'
+        awsCommand: 'eks'
+        awsSubCommand: 'update-kubeconfig'
+        awsArguments: '--name $(CLUSTER)'
+      env:
+        KUBECONFIG: ./kubeconfig
+
+    - task: AWSShellScript@1
+      inputs:
+        awsCredentials: 'aws-credentials'
+        regionName: 'us-east-1'
+        scriptType: 'inline'
+        inlineScript: |
+          KUBECONFIG=./kubeconfig helm upgrade --install test-nodejsapp ./helm -f ./helm/values-azure-$(ENV).yaml --namespace=$(NAMESPACE) --set image.tag=$(DOCKER_TAG) --debug
